@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 import joblib
 from pathlib import Path
 import sys, os
@@ -8,9 +7,9 @@ from scripts.name_utils import canonical_name
 from config.tournaments import TOURNAMENTS
 from config.surfaces import SURFACE_TRAINING_FILTER
 
-BASE_DATA = Path("data/processed")
+BASE_MODELS = Path("models")
+BASE_DATA   = Path("data/processed")
 
-# Reference dates per tournament — stats snapshot just before each event
 TOURNAMENT_REF_DATES = {
     "ao26": pd.to_datetime("2026-01-14"),
     "fo26": pd.to_datetime("2026-05-25"),
@@ -19,6 +18,7 @@ TOURNAMENT_REF_DATES = {
 # Module-level caches keyed by (tournament, tour)
 _MODELS = {}
 _STATS  = {}
+_ELO    = {}
 _CACHE  = {}
 
 def _load(tournament: str, tour: str):
@@ -30,16 +30,16 @@ def _load(tournament: str, tour: str):
     surface  = cfg["surface"]
     ref_date = TOURNAMENT_REF_DATES[tournament]
 
+    # Load model
     model_path = Path(cfg["models"][tour])
     if not model_path.exists():
         raise RuntimeError(
             f"Missing model: {model_path}\n"
             f"Run: python3 scripts/05_train_model.py --tournament {tournament} --tour {tour}"
         )
-
     _MODELS[key] = joblib.load(model_path)
 
-    # Use all-surfaces stats for clay/grass, hard-only for hard
+    # Load stats — all-surfaces for clay/grass, hard-only for hard
     if SURFACE_TRAINING_FILTER[surface] == ["hard"]:
         stats_path = BASE_DATA / tour / "rolling_player_stats.csv"
     else:
@@ -49,8 +49,8 @@ def _load(tournament: str, tour: str):
         raise RuntimeError(f"Missing stats: {stats_path}")
 
     stats = pd.read_csv(stats_path, parse_dates=["date"], low_memory=False)
+    stats["player"] = stats["player"].apply(canonical_name)
 
-    # Snapshot: latest stats per player before the tournament starts
     _STATS[key] = (
         stats[stats["date"] < ref_date]
         .sort_values("date")
@@ -59,13 +59,27 @@ def _load(tournament: str, tour: str):
         .set_index("player")
     )
 
+    # Load Elo snapshot
+    elo_path = BASE_DATA / tour / "elo_snapshot.csv"
+    if elo_path.exists():
+        elo = pd.read_csv(elo_path)
+        elo["player"] = elo["player"].apply(canonical_name)
+        _ELO[key] = elo.set_index("player")
+    else:
+        _ELO[key] = None
+
     print(f"  Loaded model + stats for {tournament.upper()} {tour.upper()} "
           f"({len(_STATS[key])} players)")
 
+
 def safe_diff(x, y, default=0.0):
-    if pd.isna(x) or pd.isna(y):
+    try:
+        if pd.isna(x) or pd.isna(y):
+            return default
+        return float(x) - float(y)
+    except Exception:
         return default
-    return float(x) - float(y)
+
 
 def predict_match(A, B, tour="atp", tournament="ao26"):
     """Return probability that player A beats player B."""
@@ -78,35 +92,47 @@ def predict_match(A, B, tour="atp", tournament="ao26"):
 
     _load(tournament, tour)
 
-    key   = (tournament, tour)
-    stats = _STATS[key]
-    model = _MODELS[key]
+    key    = (tournament, tour)
+    stats  = _STATS[key]
+    model  = _MODELS[key]
+    elo    = _ELO[key]
+    surface = TOURNAMENTS[tournament]["surface"]
 
     if A not in stats.index or B not in stats.index:
-        p = 0.45  # fallback for unknown players
+        p = 0.45
     else:
         a = stats.loc[A]
         b = stats.loc[B]
 
+        # Elo diffs
+        elo_diff_global  = 0.0
+        elo_diff_surface = 0.0
+        if elo is not None:
+            a_global = float(elo.loc[A, "elo_global"])        if A in elo.index else 1500.0
+            b_global = float(elo.loc[B, "elo_global"])        if B in elo.index else 1500.0
+            a_surf   = float(elo.loc[A, f"elo_{surface}"])    if A in elo.index else 1500.0
+            b_surf   = float(elo.loc[B, f"elo_{surface}"])    if B in elo.index else 1500.0
+            elo_diff_global  = a_global - b_global
+            elo_diff_surface = a_surf   - b_surf
+
         features = {
-            "winrate_diff":  safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
-            "odds_diff":     safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
-            "matches_diff":  safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
-            "rank_diff":     0.0,
-            "surface_wr_diff": 0.0,
+            "winrate_diff":     safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
+            "odds_diff":        safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
+            "matches_diff":     safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
+            "rank_diff":        0.0,
+            "surface_wr_diff":  0.0,
+            "elo_diff_global":  elo_diff_global,
+            "elo_diff_surface": elo_diff_surface,
         }
 
-        # Include surface_wr_diff if the model was trained with it
         X = pd.DataFrame([features])
-        model_features = model.feature_names_in_ if hasattr(model, "feature_names_in_") else list(features.keys())
 
-        # Only keep columns the model knows about
-        named_step = model.named_steps.get("scaler") or model.named_steps.get("model")
+        # Align to exactly the columns the model was trained on
         try:
-            model_cols = model.named_steps["scaler"].feature_names_in_
-            X = X[list(model_cols)]
+            model_cols = list(model.named_steps["scaler"].feature_names_in_)
+            X = X[model_cols]
         except (AttributeError, KeyError):
-            X = X[list(features.keys())]
+            pass
 
         p = float(model.predict_proba(X)[0, 1])
         p = min(max(p, 0.05), 0.95)
