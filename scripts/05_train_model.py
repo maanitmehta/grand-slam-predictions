@@ -18,6 +18,8 @@ BASE_FEATURES = [
     "odds_diff",
     "matches_diff",
     "rank_diff",
+    "elo_diff_global",
+    "elo_diff_surface",
 ]
 
 def main():

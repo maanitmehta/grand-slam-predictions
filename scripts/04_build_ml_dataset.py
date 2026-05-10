@@ -10,6 +10,7 @@ from config.surfaces import SURFACE_MAP, SURFACE_TRAINING_FILTER
 
 BASE_PROCESSED = Path("data/processed")
 BASE_RAW       = Path("data/raw")
+ELO_INIT       = 1500.0
 
 def main():
     parser = argparse.ArgumentParser()
@@ -17,38 +18,36 @@ def main():
     parser.add_argument("--tour",       required=True, choices=["atp", "wta"])
     args = parser.parse_args()
 
-    cfg             = TOURNAMENTS[args.tournament]
-    surface         = cfg["surface"]
+    cfg              = TOURNAMENTS[args.tournament]
+    surface          = cfg["surface"]
     allowed_surfaces = SURFACE_TRAINING_FILTER[surface]
-    tour            = args.tour
+    tour             = args.tour
 
     print(f"\n=== Building ML dataset for {tour.upper()} | {cfg['name']} | surface: {surface} ===")
 
     out_file      = BASE_PROCESSED / tour / f"ml_dataset_{args.tournament}.csv"
-    if allowed_surfaces == ["hard"]:
-        stats_path = BASE_PROCESSED / tour / "rolling_player_stats.csv"
-    else:
-        stats_path = BASE_PROCESSED / tour / "rolling_player_stats_all_surfaces.csv"
-        
     rankings_path = BASE_RAW / f"{tour}_rankings.csv"
 
-    for p in [stats_path, rankings_path]:
+    # Use all-surfaces stats for clay/grass, hard-only for hard
+    if allowed_surfaces == ["hard"]:
+        stats_path  = BASE_PROCESSED / tour / "rolling_player_stats.csv"
+        matches_src = BASE_PROCESSED / tour / "model_base.csv"
+    else:
+        stats_path  = BASE_PROCESSED / tour / "rolling_player_stats_all_surfaces.csv"
+        matches_src = BASE_PROCESSED / tour / "all_matches.csv"
+
+    for p in [stats_path, rankings_path, matches_src]:
         if not p.exists():
             raise RuntimeError(f"Missing file: {p}")
 
-    # Use all_matches for non-hard surfaces (model_base is hard-only)
+    # Load matches
     if allowed_surfaces == ["hard"]:
-        matches = pd.read_csv(BASE_PROCESSED / tour / "model_base.csv",
-                              parse_dates=["date"])
-        # model_base already has canonical odds columns
-        matches["b365w_col"] = matches.get("b365w", np.nan)
-        matches["b365l_col"] = matches.get("b365l", np.nan)
+        matches = pd.read_csv(matches_src, parse_dates=["date"])
     else:
-        matches = pd.read_csv(BASE_PROCESSED / tour / "all_matches.csv",
-                              low_memory=False, parse_dates=["date"])
+        matches = pd.read_csv(matches_src, low_memory=False, parse_dates=["date"])
         matches = matches.rename(columns={"B365W": "b365w", "B365L": "b365l"})
 
-    # Normalise and filter surface
+    # Normalise and filter by surface
     matches["surface_canonical"] = matches["surface"].map(SURFACE_MAP).fillna("hard")
     matches = matches[matches["surface_canonical"].isin(allowed_surfaces)].copy()
     print(f"  Matches after surface filter {allowed_surfaces}: {len(matches):,}")
@@ -56,12 +55,21 @@ def main():
     if len(matches) == 0:
         raise RuntimeError("No matches after surface filter — check SURFACE_MAP values.")
 
-    # Load surface-specific rolling features
-    surf_feat_path = BASE_PROCESSED / tour / f"{surface}_surface_features.csv"
+    # Load surface rolling features
     surf_feats = None
+    surf_feat_path = BASE_PROCESSED / tour / f"{surface}_surface_features.csv"
     if surf_feat_path.exists():
         surf_feats = pd.read_csv(surf_feat_path, parse_dates=["date"])
         print(f"  Loaded surface features: {len(surf_feats):,} rows")
+
+    # Load Elo history
+    elo_hist = None
+    elo_path = BASE_PROCESSED / tour / "elo_history.csv"
+    if elo_path.exists():
+        elo_hist = pd.read_csv(elo_path, parse_dates=["date"])
+        print(f"  Loaded Elo history: {len(elo_hist):,} rows")
+    else:
+        print("  No Elo history found — run 08_build_elo_ratings.py to add Elo features")
 
     # Rankings
     rankings = (
@@ -72,7 +80,7 @@ def main():
         .set_index("player")
     )
 
-    stats = pd.read_csv(stats_path, parse_dates=["date"])
+    stats = pd.read_csv(stats_path, parse_dates=["date"], low_memory=False)
     stats = stats[["player", "date", "winrate_lastN", "avg_odds_lastN", "matches_played_lastN"]]
 
     rows = []
@@ -108,19 +116,62 @@ def main():
             if not pd.isna(w_sr) and not pd.isna(l_sr):
                 surf_diff = w_sr - l_sr
 
-        rows.append({"winrate_diff": w_stats["winrate_lastN"] - l_stats["winrate_lastN"],
-                     "odds_diff":    w_stats["avg_odds_lastN"] - l_stats["avg_odds_lastN"],
-                     "matches_diff": w_stats["matches_played_lastN"] - l_stats["matches_played_lastN"],
-                     "rank_diff":    rankB - rankA,
-                     "surface_wr_diff": surf_diff,
-                     "a_wins": 1})
+        # Elo diffs (pre-match ratings, winner perspective)
+        elo_diff_global  = 0.0
+        elo_diff_surface = 0.0
+        if elo_hist is not None:
+            # Look up winner's pre-match Elo
+            w_row = elo_hist[(elo_hist["winner"] == w) & (elo_hist["date"] == date)]
+            if len(w_row) == 0:
+                w_row = elo_hist[(elo_hist["loser"] == w) & (elo_hist["date"] == date)]
+                if len(w_row) > 0:
+                    w_global = w_row.iloc[0]["l_elo_global"]
+                    w_surf   = w_row.iloc[0].get(f"l_elo_{surface}", ELO_INIT)
+                else:
+                    w_global = w_surf = ELO_INIT
+            else:
+                w_global = w_row.iloc[0]["w_elo_global"]
+                w_surf   = w_row.iloc[0].get(f"w_elo_{surface}", ELO_INIT)
 
-        rows.append({"winrate_diff": l_stats["winrate_lastN"] - w_stats["winrate_lastN"],
-                     "odds_diff":    l_stats["avg_odds_lastN"] - w_stats["avg_odds_lastN"],
-                     "matches_diff": l_stats["matches_played_lastN"] - w_stats["matches_played_lastN"],
-                     "rank_diff":    rankA - rankB,
-                     "surface_wr_diff": -surf_diff,
-                     "a_wins": 0})
+            # Look up loser's pre-match Elo
+            l_row = elo_hist[(elo_hist["loser"] == l) & (elo_hist["date"] == date)]
+            if len(l_row) == 0:
+                l_row = elo_hist[(elo_hist["winner"] == l) & (elo_hist["date"] == date)]
+                if len(l_row) > 0:
+                    l_global = l_row.iloc[0]["w_elo_global"]
+                    l_surf   = l_row.iloc[0].get(f"w_elo_{surface}", ELO_INIT)
+                else:
+                    l_global = l_surf = ELO_INIT
+            else:
+                l_global = l_row.iloc[0]["l_elo_global"]
+                l_surf   = l_row.iloc[0].get(f"l_elo_{surface}", ELO_INIT)
+
+            elo_diff_global  = float(w_global) - float(l_global)
+            elo_diff_surface = float(w_surf)   - float(l_surf)
+
+        # Winner row
+        rows.append({
+            "winrate_diff":     w_stats["winrate_lastN"]       - l_stats["winrate_lastN"],
+            "odds_diff":        w_stats["avg_odds_lastN"]       - l_stats["avg_odds_lastN"],
+            "matches_diff":     w_stats["matches_played_lastN"] - l_stats["matches_played_lastN"],
+            "rank_diff":        rankB - rankA,
+            "surface_wr_diff":  surf_diff,
+            "elo_diff_global":  elo_diff_global,
+            "elo_diff_surface": elo_diff_surface,
+            "a_wins": 1,
+        })
+
+        # Loser row (symmetric — flip all diffs)
+        rows.append({
+            "winrate_diff":     l_stats["winrate_lastN"]       - w_stats["winrate_lastN"],
+            "odds_diff":        l_stats["avg_odds_lastN"]       - w_stats["avg_odds_lastN"],
+            "matches_diff":     l_stats["matches_played_lastN"] - w_stats["matches_played_lastN"],
+            "rank_diff":        rankA - rankB,
+            "surface_wr_diff":  -surf_diff,
+            "elo_diff_global":  -elo_diff_global,
+            "elo_diff_surface": -elo_diff_surface,
+            "a_wins": 0,
+        })
 
     df = pd.DataFrame(rows).dropna()
     df["a_wins"] = df["a_wins"].astype(int)
