@@ -80,9 +80,13 @@ Surface Elo dominates — historical clay dominance is the strongest signal.
 **WTA clay:** `elo_diff_global` > `elo_diff_surface` > `rank_diff`
 Global dominance carries more weight — top WTA players (Swiatek, Sabalenka) are strong across all surfaces.
 
-### FO26 title probabilities (placeholder draw)
+---
 
-**ATP**
+## FO26 predictions (~22 May 2026)
+
+*Probabilities below use a placeholder draw. Final probabilities will be updated when the real FO26 draw is released (~22 May 2026).*
+
+### ATP — Predicted title probabilities
 
 | Player | Probability | 90% CI |
 |--------|------------|--------|
@@ -91,8 +95,15 @@ Global dominance carries more weight — top WTA players (Swiatek, Sabalenka) ar
 | Djokovic N. | 11.9% | [10.3% – 13.8%] |
 | Zverev A. | 5.0% | [4.0% – 6.3%] |
 | Ruud C. | 2.9% | [2.1% – 3.6%] |
+| Musetti L. | 2.7% | [1.8% – 3.5%] |
+| Medvedev D. | 1.1% | [0.6% – 1.6%] |
+| Minaur A. | 1.0% | [0.6% – 1.7%] |
+| Auger-Aliassime F. | 1.0% | [0.5% – 1.6%] |
+| Rublev A. | 1.0% | [0.5% – 1.4%] |
 
-**WTA**
+*Full standings: `results/fo26/atp_probs.csv`*
+
+### WTA — Predicted title probabilities
 
 | Player | Probability | 90% CI |
 |--------|------------|--------|
@@ -101,8 +112,57 @@ Global dominance carries more weight — top WTA players (Swiatek, Sabalenka) ar
 | Sabalenka A. | 11.8% | [10.1% – 13.6%] |
 | Anisimova A. | 7.0% | [5.8% – 8.5%] |
 | Rybakina E. | 6.6% | [5.4% – 8.0%] |
+| Paolini J. | 3.6% | [2.7% – 4.6%] |
+| Pegula J. | 3.4% | [2.4% – 4.3%] |
+| Svitolina E. | 2.7% | [2.1% – 3.5%] |
+| Andreeva M. | 1.8% | [1.1% – 2.4%] |
+| Muchova K. | 1.4% | [0.8% – 2.0%] |
 
-*Note: probabilities above use a placeholder draw (AO26 draw). Final probabilities will be updated when the real FO26 draw is released (~22 May 2026).*
+*Full standings: `results/fo26/wta_probs.csv`*
+
+---
+
+## AO26 predictions (January 2026)
+
+Predictions made before the Australian Open 2026 using the original hard-court model.
+Full results preserved in `results/ao26/`.
+
+### ATP — Predicted title probabilities
+
+| Player | Probability |
+|--------|------------|
+| Alcaraz C. | 5.1% |
+| Sinner J. | 5.0% |
+| Djokovic N. | 4.1% |
+| Medjedovic H. | 3.4% |
+| Fritz T. | 3.0% |
+| Monfils G. | 2.4% |
+| Tsitsipas S. | 2.4% |
+| Paul T. | 2.2% |
+| Tien L. | 2.2% |
+| Medvedev D. | 2.1% |
+
+*Full standings (128 players): `results/ao26/atp_probs.csv`*
+
+### WTA — Predicted title probabilities
+
+| Player | Probability |
+|--------|------------|
+| Swiatek I. | 8.0% |
+| Potapova A. | 3.7% |
+| Keys M. | 3.5% |
+| Gauff C. | 3.4% |
+| Pegula J. | 2.7% |
+| Svitolina E. | 2.7% |
+| Andreeva M. | 2.3% |
+| Sabalenka A. | 2.2% |
+| Joint M. | 2.0% |
+| Kasatkina D. | 1.9% |
+
+*Full standings (128 players): `results/ao26/wta_probs.csv`*
+
+> These predictions used the original hard-court model (no surface Elo, no clay features).
+> The pipeline has since been upgraded — see French Open 2026 section above.
 
 ---
 
@@ -220,6 +280,7 @@ openpyxl
 ```
 
 Install with:
+
 ```bash
 pip3 install pandas numpy scikit-learn joblib matplotlib openpyxl
 ```
