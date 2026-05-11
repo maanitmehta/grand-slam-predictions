@@ -245,13 +245,6 @@ python3 scripts/09_stress_test.py --tournament fo26 --tour atp
 python3 scripts/09_stress_test.py --tournament fo26 --tour wta
 ```
 
-### Adding a new tournament (e.g. Wimbledon 2026)
-
-1. Add an entry to `config/tournaments.py` with surface `"grass"`
-2. Add `"wimbledon26"` to `config/surfaces.py` TOURNAMENT_SURFACE dict
-3. Drop `atp_draw.csv` and `wta_draw.csv` into `data/draws/wimbledon26/`
-4. Run the pipeline above with `--tournament wimbledon26`
-
 ---
 
 ## Draw CSV format
@@ -265,6 +258,27 @@ Alcaraz C.,Zandschulp B.
 Sinner J.,Cazaux A.
 ...
 ```
+
+---
+
+## Roadmap
+
+### Wimbledon 2026
+The pipeline is designed to support grass courts with no structural changes needed.
+To add Wimbledon 2026 once the draw is released (late June):
+
+1. Add an entry to `config/tournaments.py` with surface `"grass"`
+2. Add `"wimbledon26"` to `config/surfaces.py` TOURNAMENT_SURFACE dict
+3. Drop `atp_draw.csv` and `wta_draw.csv` into `data/draws/wimbledon26/`
+4. Run the full pipeline with `--tournament wimbledon26`
+
+### Post FO26 model improvements
+After the French Open results are in, planned upgrades include:
+- Head-to-head record as a feature
+- Recent form weighting (last 3 matches weighted higher)
+- Tournament-specific historical performance
+- XGBoost / LightGBM to replace Logistic Regression
+- Post-tournament accuracy audit comparing predictions vs actual results
 
 ---
 
