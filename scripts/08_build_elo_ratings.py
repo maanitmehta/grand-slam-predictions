@@ -9,8 +9,10 @@ from config.surfaces import SURFACE_MAP
 BASE_PROCESSED = Path("data/processed")
 
 # Elo tuning parameters
-K_BASE     = 32    # base K-factor (how fast ratings update)
-K_SLAM     = 48    # higher K for Grand Slams (more signal)
+# Clay: lower K = longer form memory (consistent excellence rewarded over years)
+# Grass: higher K = shorter memory (peaking at the right moment matters more)
+K_SURFACE  = {"clay": 24, "hard": 32, "grass": 40, "global": 32}
+K_SURFACE_SLAM = {"clay": 36, "hard": 48, "grass": 60, "global": 48}
 ELO_INIT   = 1500  # starting rating for all players
 SURFACES   = ["global", "clay", "hard", "grass"]
 
@@ -56,7 +58,6 @@ def compute_elo(tour: str):
         w = row["winner"]
         l = row["loser"]
         surf = row["surface_canonical"]
-        k = K_SLAM if is_slam(row.get("tournament", "")) else K_BASE
 
         # Snapshot BEFORE update (pre-match ratings as features)
         snap = {
@@ -72,14 +73,16 @@ def compute_elo(tour: str):
         records.append(snap)
 
         # Update global Elo
+        k_global = K_SURFACE_SLAM["global"] if is_slam(row.get("tournament", "")) else K_SURFACE["global"]
         rw_g, rl_g = update_elo(get_rating("global", w),
-                                 get_rating("global", l), "A", k)
+                                 get_rating("global", l), "A", k_global)
         ratings["global"][w] = rw_g
         ratings["global"][l] = rl_g
 
-        # Update surface-specific Elo
+        # Update surface-specific Elo with per-surface K-factor
+        k_surf = K_SURFACE_SLAM.get(surf, K_SURFACE_SLAM["hard"]) if is_slam(row.get("tournament", "")) else K_SURFACE.get(surf, K_SURFACE["hard"])
         rw_s, rl_s = update_elo(get_rating(surf, w),
-                                 get_rating(surf, l), "A", k)
+                                 get_rating(surf, l), "A", k_surf)
         ratings[surf][w] = rw_s
         ratings[surf][l] = rl_s
 

@@ -17,7 +17,7 @@ def simulate_round(players, round_name, tour, tournament, verbose=False):
     winners = []
     for i in range(0, len(players), 2):
         A, B = players[i], players[i + 1]
-        p = predict_match(A, B, tour=tour, tournament=tournament)
+        p = predict_match(A, B, tour=tour, tournament=tournament, round_name=round_name)
         winner = A if np.random.rand() < p else B
         winners.append(winner)
         if verbose:

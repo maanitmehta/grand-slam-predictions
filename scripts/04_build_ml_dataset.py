@@ -149,8 +149,14 @@ def main():
             elo_diff_global  = float(w_global) - float(l_global)
             elo_diff_surface = float(w_surf)   - float(l_surf)
 
-        # Winner row
-        rows.append({
+        match_round  = m.get("Round", np.nan)
+        # ATP uses "Series", WTA uses "Tier"
+        match_series = m.get("Series", None) or m.get("Tier", np.nan)
+        w_rank_raw   = pd.to_numeric(m.get("winner_rank", np.nan), errors="coerce")
+        l_rank_raw   = pd.to_numeric(m.get("loser_rank",  np.nan), errors="coerce")
+        max_rank     = max(w_rank_raw, l_rank_raw) if pd.notna(w_rank_raw) and pd.notna(l_rank_raw) else np.nan
+
+        base = {
             "winrate_diff":     w_stats["winrate_lastN"]       - l_stats["winrate_lastN"],
             "odds_diff":        w_stats["avg_odds_lastN"]       - l_stats["avg_odds_lastN"],
             "matches_diff":     w_stats["matches_played_lastN"] - l_stats["matches_played_lastN"],
@@ -158,22 +164,29 @@ def main():
             "surface_wr_diff":  surf_diff,
             "elo_diff_global":  elo_diff_global,
             "elo_diff_surface": elo_diff_surface,
-            "a_wins": 1,
-        })
+            "match_round":      match_round,
+            "match_series":     match_series,
+            "max_rank":         max_rank,
+        }
+
+        # Winner row
+        rows.append({**base, "a_wins": 1})
 
         # Loser row (symmetric — flip all diffs)
-        rows.append({
-            "winrate_diff":     l_stats["winrate_lastN"]       - w_stats["winrate_lastN"],
-            "odds_diff":        l_stats["avg_odds_lastN"]       - w_stats["avg_odds_lastN"],
-            "matches_diff":     l_stats["matches_played_lastN"] - w_stats["matches_played_lastN"],
-            "rank_diff":        rankA - rankB,
-            "surface_wr_diff":  -surf_diff,
-            "elo_diff_global":  -elo_diff_global,
-            "elo_diff_surface": -elo_diff_surface,
+        rows.append({**base,
+            "winrate_diff":     -base["winrate_diff"],
+            "odds_diff":        -base["odds_diff"],
+            "matches_diff":     -base["matches_diff"],
+            "rank_diff":        -base["rank_diff"],
+            "surface_wr_diff":  -base["surface_wr_diff"],
+            "elo_diff_global":  -base["elo_diff_global"],
+            "elo_diff_surface": -base["elo_diff_surface"],
             "a_wins": 0,
         })
 
-    df = pd.DataFrame(rows).dropna()
+    feature_cols = ["winrate_diff", "odds_diff", "matches_diff", "rank_diff",
+                    "surface_wr_diff", "elo_diff_global", "elo_diff_surface"]
+    df = pd.DataFrame(rows).dropna(subset=feature_cols)
     df["a_wins"] = df["a_wins"].astype(int)
 
     out_file.parent.mkdir(parents=True, exist_ok=True)

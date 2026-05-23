@@ -236,7 +236,7 @@ def test_bootstrap_ci(draw_path: Path, tour: str, tournament: str,
             next_round = []
             for i in range(0, len(players), 2):
                 A, B = players[i], players[i+1]
-                p = predict_match(A, B, tour=tour, tournament=tournament)
+                p = predict_match(A, B, tour=tour, tournament=tournament, round_name=r)
                 next_round.append(A if np.random.rand() < p else B)
             players = next_round
         return players[0]
@@ -294,6 +294,98 @@ def test_bootstrap_ci(draw_path: Path, tour: str, tournament: str,
 
 
 # ─────────────────────────────────────────────
+# 5. STRATIFIED SLAM-DEPTH BACKTEST
+#    Clay, R16+, both players ranked top 30
+#    Tests model in the regime RG actually lives in
+# ─────────────────────────────────────────────
+SLAM_LATE_ROUNDS = {"4th Round", "Quarterfinals", "Semifinals", "The Final"}
+
+def test_stratified_slam_depth(df: pd.DataFrame, tour: str, tournament: str, out_dir: Path):
+    print("\n── Stratified Slam-Depth Backtest (Clay · R16+ · Both Top 30) ──")
+
+    required = {"match_round", "match_series", "max_rank"}
+    if not required.issubset(df.columns):
+        print("  Skipping — metadata columns missing. Re-run 04_build_ml_dataset.py first.")
+        return None
+
+    mask = (
+        df["match_series"].str.contains("Grand Slam", na=False) &
+        df["match_round"].isin(SLAM_LATE_ROUNDS) &
+        (df["max_rank"] <= 30)
+    )
+    sub = df[mask].copy()
+    n_matches = len(sub) // 2  # two rows per match
+    print(f"  Subgroup size: {len(sub):,} rows (~{n_matches} matches over 25 years)")
+
+    if len(sub) < 100:
+        print("  Skipping — too few rows for meaningful walk-forward.")
+        return None
+
+    features = [f for f in FEATURES if f in sub.columns]
+    X = sub[features].values
+    y = sub["a_wins"].values
+    n = len(sub)
+
+    n_folds   = 5
+    fold_size = n // n_folds
+    min_train = 60
+
+    results = []
+    for fold in range(2, n_folds):
+        train_end = fold * fold_size
+        test_end  = min((fold + 1) * fold_size, n)
+        if train_end < min_train:
+            continue
+
+        X_train, y_train = X[:train_end],         y[:train_end]
+        X_test,  y_test  = X[train_end:test_end],  y[train_end:test_end]
+
+        scaler = StandardScaler().fit(X_train)
+        model  = LogisticRegression(max_iter=1000)
+        model.fit(scaler.transform(X_train), y_train)
+
+        preds  = model.predict(scaler.transform(X_test))
+        probas = model.predict_proba(scaler.transform(X_test))
+        results.append({
+            "fold":      fold,
+            "train_rows": train_end,
+            "test_rows":  len(y_test),
+            "accuracy":   accuracy_score(y_test, preds),
+            "log_loss":   log_loss(y_test, probas),
+        })
+
+    if not results:
+        print("  No folds passed minimum training threshold.")
+        return None
+
+    wf = pd.DataFrame(results)
+    print(wf[["fold", "train_rows", "test_rows", "accuracy", "log_loss"]].to_string(index=False))
+    mean_acc = wf["accuracy"].mean()
+    std_acc  = wf["accuracy"].std()
+    print(f"\n  Mean accuracy (slam depth): {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"  NOTE: n≈{n_matches} — wide confidence intervals expected. Treat as directional only.")
+
+    # Feature importance on this subgroup
+    print("\n  Feature importance at slam depth:")
+    importances = []
+    scaler_full = StandardScaler().fit(X)
+    model_full  = LogisticRegression(max_iter=1000).fit(scaler_full.transform(X), y)
+    base_acc    = accuracy_score(y, model_full.predict(scaler_full.transform(X)))
+    Xs = scaler_full.transform(X)
+    for i, feat in enumerate(features):
+        drops = []
+        for _ in range(10):
+            Xp = Xs.copy()
+            np.random.shuffle(Xp[:, i])
+            drops.append(base_acc - accuracy_score(y, model_full.predict(Xp)))
+        importances.append({"feature": feat, "importance": np.mean(drops)})
+    imp = pd.DataFrame(importances).sort_values("importance", ascending=False)
+    print(imp.to_string(index=False))
+
+    return wf
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
@@ -324,10 +416,11 @@ def main():
     df = pd.read_csv(data_path)
     print(f"\n  Dataset: {len(df):,} rows | Features: {[f for f in FEATURES if f in df.columns]}")
 
-    # Run all four tests
+    # Run all five tests
     mce     = test_calibration(df, tour, args.tournament, out_dir)
     imp_df  = test_feature_importance(df, tour, args.tournament, out_dir)
     wf      = test_walk_forward(df, tour, args.tournament, out_dir)
+    wf_slam = test_stratified_slam_depth(df, tour, args.tournament, out_dir)
 
     if not args.skip_bootstrap:
         ci = test_bootstrap_ci(draw_path, tour, args.tournament, out_dir)
@@ -339,7 +432,9 @@ def main():
     print(f"  STRESS TEST SUMMARY — {tour.upper()} {args.tournament.upper()}")
     print(f"{'='*55}")
     print(f"  Calibration error:       {mce:.4f}  {'✓ good' if mce < 0.05 else '⚠ needs work'}")
-    print(f"  Walk-forward mean acc:   {wf['accuracy'].mean():.4f} ± {wf['accuracy'].std():.4f}")
+    print(f"  Walk-forward mean acc:   {wf['accuracy'].mean():.4f} ± {wf['accuracy'].std():.4f}  (all clay)")
+    if wf_slam is not None:
+        print(f"  Slam-depth mean acc:     {wf_slam['accuracy'].mean():.4f} ± {wf_slam['accuracy'].std():.4f}  (R16+, both top 30) ⚠ small sample")
     top_feat = imp_df.sort_values("importance_mean", ascending=False).iloc[0]
     print(f"  Most important feature:  {top_feat['feature']} ({top_feat['importance_mean']:.4f})")
     print(f"\n  Charts saved to: {out_dir}/")

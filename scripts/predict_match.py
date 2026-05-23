@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
@@ -9,17 +10,24 @@ from config.surfaces import SURFACE_TRAINING_FILTER
 
 BASE_MODELS = Path("models")
 BASE_DATA   = Path("data/processed")
+BASE_RAW    = Path("data/raw")
 
 TOURNAMENT_REF_DATES = {
     "ao26": pd.to_datetime("2026-01-14"),
     "fo26": pd.to_datetime("2026-05-25"),
 }
 
+# Default log-rank for players not in rankings file (~200 = fringe tour player)
+_LOG_RANK_DEFAULT = np.log(200)
+
 # Module-level caches keyed by (tournament, tour)
-_MODELS = {}
-_STATS  = {}
-_ELO    = {}
-_CACHE  = {}
+_MODELS  = {}
+_STATS   = {}
+_ELO     = {}
+_SURF_WR = {}
+_RANKS   = {}
+_CACHE   = {}
+
 
 def _load(tournament: str, tour: str):
     key = (tournament, tour)
@@ -30,7 +38,7 @@ def _load(tournament: str, tour: str):
     surface  = cfg["surface"]
     ref_date = TOURNAMENT_REF_DATES[tournament]
 
-    # Load model
+    # Model
     model_path = Path(cfg["models"][tour])
     if not model_path.exists():
         raise RuntimeError(
@@ -39,18 +47,16 @@ def _load(tournament: str, tour: str):
         )
     _MODELS[key] = joblib.load(model_path)
 
-    # Load stats — all-surfaces for clay/grass, hard-only for hard
-    if SURFACE_TRAINING_FILTER[surface] == ["hard"]:
-        stats_path = BASE_DATA / tour / "rolling_player_stats.csv"
-    else:
-        stats_path = BASE_DATA / tour / "rolling_player_stats_all_surfaces.csv"
-
+    # Rolling stats (all-surfaces for clay/grass, hard-only for hard)
+    stats_path = (
+        BASE_DATA / tour / "rolling_player_stats.csv"
+        if SURFACE_TRAINING_FILTER[surface] == ["hard"]
+        else BASE_DATA / tour / "rolling_player_stats_all_surfaces.csv"
+    )
     if not stats_path.exists():
         raise RuntimeError(f"Missing stats: {stats_path}")
-
     stats = pd.read_csv(stats_path, parse_dates=["date"], low_memory=False)
     stats["player"] = stats["player"].apply(canonical_name)
-
     _STATS[key] = (
         stats[stats["date"] < ref_date]
         .sort_values("date")
@@ -59,7 +65,7 @@ def _load(tournament: str, tour: str):
         .set_index("player")
     )
 
-    # Load Elo snapshot
+    # Elo snapshot
     elo_path = BASE_DATA / tour / "elo_snapshot.csv"
     if elo_path.exists():
         elo = pd.read_csv(elo_path)
@@ -68,17 +74,42 @@ def _load(tournament: str, tour: str):
     else:
         _ELO[key] = None
 
+    # Surface win rates (most recent before ref_date)
+    surf_wr_path = BASE_DATA / tour / f"{surface}_surface_features.csv"
+    if surf_wr_path.exists():
+        sf  = pd.read_csv(surf_wr_path, parse_dates=["date"])
+        sf["Player"] = sf["Player"].apply(canonical_name)
+        col = f"{surface}_win_rate_20"
+        if col in sf.columns:
+            recent = (
+                sf[sf["date"] < ref_date]
+                .sort_values("date")
+                .groupby("Player")
+                .last()
+            )
+            _SURF_WR[key] = recent[col].dropna().to_dict()
+        else:
+            _SURF_WR[key] = {}
+    else:
+        _SURF_WR[key] = {}
+
+    # Current rankings (log scale, consistent with training)
+    ranks_path = BASE_RAW / f"{tour}_rankings.csv"
+    if ranks_path.exists():
+        rk = pd.read_csv(ranks_path)
+        rk["player"] = rk["player"].apply(canonical_name)
+        _RANKS[key] = {row["player"]: np.log(row["rank"]) for _, row in rk.iterrows()}
+    else:
+        _RANKS[key] = {}
+
     print(f"  Loaded model + stats for {tournament.upper()} {tour.upper()} "
           f"({len(_STATS[key])} players)")
 
 
-# Elo rating assigned to players with no history in the database.
-# ~1500 = median tour player; gives them ~4% vs Sinner/Swiatek, ~24% vs a fringe tour player.
 _FALLBACK_ELO = 1500.0
 
 
 def _elo_prob(a_elo: float, b_elo: float) -> float:
-    """Standard Elo win-probability formula."""
     return 1.0 / (1.0 + 10.0 ** (-(a_elo - b_elo) / 400.0))
 
 
@@ -97,7 +128,7 @@ def safe_diff(x, y, default=0.0):
         return default
 
 
-def predict_match(A, B, tour="atp", tournament="ao26"):
+def predict_match(A, B, tour="atp", tournament="ao26", **kwargs):
     """Return probability that player A beats player B."""
     A = canonical_name(A)
     B = canonical_name(B)
@@ -108,58 +139,53 @@ def predict_match(A, B, tour="atp", tournament="ao26"):
 
     _load(tournament, tour)
 
-    key    = (tournament, tour)
-    stats  = _STATS[key]
-    model  = _MODELS[key]
-    elo    = _ELO[key]
+    key     = (tournament, tour)
+    stats   = _STATS[key]
+    model   = _MODELS[key]
+    elo     = _ELO[key]
+    surf_wr = _SURF_WR[key]
+    ranks   = _RANKS[key]
     surface = TOURNAMENTS[tournament]["surface"]
 
+    a_surf   = _get_elo(A, elo, f"elo_{surface}")
+    b_surf   = _get_elo(B, elo, f"elo_{surface}")
+    a_global = _get_elo(A, elo, "elo_global")
+    b_global = _get_elo(B, elo, "elo_global")
+
+    # No rolling stats for this player — fall back to Elo blend
     if A not in stats.index or B not in stats.index:
-        # Fall back to Elo-only prediction.
-        # Players absent from Elo get _FALLBACK_ELO (~median tour rating),
-        # which gives wildcards/qualifiers a realistic ~4% vs a top-10 player.
-        a_global  = _get_elo(A, elo, "elo_global")
-        b_global  = _get_elo(B, elo, "elo_global")
-        a_surface = _get_elo(A, elo, f"elo_{surface}")
-        b_surface = _get_elo(B, elo, f"elo_{surface}")
-        p = 0.5 * _elo_prob(a_global, b_global) + 0.5 * _elo_prob(a_surface, b_surface)
+        p = 0.5 * _elo_prob(a_global, b_global) + 0.5 * _elo_prob(a_surf, b_surf)
         p = min(max(p, 0.05), 0.95)
-    else:
-        a = stats.loc[A]
-        b = stats.loc[B]
+        _CACHE[cache_key] = p
+        return p
 
-        # Elo diffs
-        elo_diff_global  = 0.0
-        elo_diff_surface = 0.0
-        if elo is not None:
-            a_global = float(elo.loc[A, "elo_global"])        if A in elo.index else 1500.0
-            b_global = float(elo.loc[B, "elo_global"])        if B in elo.index else 1500.0
-            a_surf   = float(elo.loc[A, f"elo_{surface}"])    if A in elo.index else 1500.0
-            b_surf   = float(elo.loc[B, f"elo_{surface}"])    if B in elo.index else 1500.0
-            elo_diff_global  = a_global - b_global
-            elo_diff_surface = a_surf   - b_surf
+    a = stats.loc[A]
+    b = stats.loc[B]
 
-        features = {
-            "winrate_diff":     safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
-            "odds_diff":        safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
-            "matches_diff":     safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
-            "rank_diff":        0.0,
-            "surface_wr_diff":  0.0,
-            "elo_diff_global":  elo_diff_global,
-            "elo_diff_surface": elo_diff_surface,
-        }
+    rank_a = ranks.get(A, _LOG_RANK_DEFAULT)
+    rank_b = ranks.get(B, _LOG_RANK_DEFAULT)
 
-        X = pd.DataFrame([features])
+    swr_a = surf_wr.get(A, float("nan"))
+    swr_b = surf_wr.get(B, float("nan"))
 
-        # Align to exactly the columns the model was trained on
-        try:
-            model_cols = list(model.named_steps["scaler"].feature_names_in_)
-            X = X[model_cols]
-        except (AttributeError, KeyError):
-            pass
+    features = {
+        "winrate_diff":     safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
+        "odds_diff":        safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
+        "matches_diff":     safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
+        "rank_diff":        rank_b - rank_a,
+        "surface_wr_diff":  safe_diff(swr_a, swr_b),
+        "elo_diff_global":  a_global - b_global,
+        "elo_diff_surface": a_surf   - b_surf,
+    }
 
-        p = float(model.predict_proba(X)[0, 1])
-        p = min(max(p, 0.05), 0.95)
+    X = pd.DataFrame([features])
+    try:
+        model_cols = list(model.named_steps["scaler"].feature_names_in_)
+        X = X[model_cols]
+    except (AttributeError, KeyError):
+        pass
 
+    p = float(model.predict_proba(X)[0, 1])
+    p = min(max(p, 0.05), 0.95)
     _CACHE[cache_key] = p
     return p
