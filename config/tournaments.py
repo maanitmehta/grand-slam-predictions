@@ -20,6 +20,9 @@ TOURNAMENTS = {
                     "wta": "data/draws/fo26/wta_draw.csv"},
         "models":  {"atp": "models/fo26/atp_model.pkl",
                     "wta": "models/fo26/wta_model.pkl"},
+        # Standalone models exclude mkt_prob_diff — used for tournament simulation
+        "sim_models": {"atp": "models/fo26/atp_sim_model.pkl",
+                       "wta": "models/fo26/wta_sim_model.pkl"},
         "results": {"atp": "results/fo26/atp_probs.csv",
                     "wta": "results/fo26/wta_probs.csv"},
     },

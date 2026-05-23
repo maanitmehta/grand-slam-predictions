@@ -12,6 +12,25 @@ BASE_PROCESSED = Path("data/processed")
 BASE_RAW       = Path("data/raw")
 ELO_INIT       = 1500.0
 
+# Ordinal round depth — later rounds carry more signal (stronger field, higher stakes)
+ROUND_DEPTH_MAP = {
+    "R128": 1, "Round 1": 1, "1st Round": 1,
+    "R64":  2, "Round 2": 2, "2nd Round": 2,
+    "R32":  3, "Round 3": 3, "3rd Round": 3,
+    "R16":  4, "Round 4": 4, "4th Round": 4,
+    "QF":   5, "Quarterfinals": 5,
+    "SF":   6, "Semifinals": 6,
+    "F":    7, "The Final": 7, "Final": 7,
+    "RR":   2,
+}
+
+RG_NAMES = ["roland garros", "french open", "roland-garros"]
+
+def _is_rg(tournament_name) -> bool:
+    if pd.isna(tournament_name):
+        return False
+    return any(s in str(tournament_name).lower() for s in RG_NAMES)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tournament", required=True, choices=TOURNAMENTS.keys())
@@ -81,7 +100,34 @@ def main():
     )
 
     stats = pd.read_csv(stats_path, parse_dates=["date"], low_memory=False)
-    stats = stats[["player", "date", "winrate_lastN", "avg_odds_lastN", "matches_played_lastN"]]
+    stat_cols = ["player", "date", "winrate_lastN", "avg_odds_lastN", "matches_played_lastN"]
+    for opt_col in ("avg_sets_lastN", "avg_rest_days_lastN", "quality_winrate_lastN", "clay_winrate_lastN"):
+        if opt_col in stats.columns:
+            stat_cols.append(opt_col)
+    stats = stats[stat_cols]
+
+    # Sort by date for running H2H (no lookahead)
+    matches = matches.sort_values("date").reset_index(drop=True)
+
+    # Running clay H2H: keyed by (min(p1,p2), max(p1,p2)) → {p1: wins, p2: wins}
+    h2h_clay: dict = {}
+
+    def _h2h_diff(w: str, l: str) -> float:
+        key = (min(w, l), max(w, l))
+        if key not in h2h_clay:
+            return 0.0
+        rec = h2h_clay[key]
+        return float(rec.get(w, 0) - rec.get(l, 0))
+
+    def _h2h_update(w: str, l: str) -> None:
+        key = (min(w, l), max(w, l))
+        if key not in h2h_clay:
+            h2h_clay[key] = {}
+        h2h_clay[key][w] = h2h_clay[key].get(w, 0) + 1
+        h2h_clay[key].setdefault(l, 0)
+
+    # Determine whether this tournament is Roland Garros (for RG-specific Elo)
+    is_rg_tournament = args.tournament.startswith("fo") or "roland" in cfg.get("name", "").lower()
 
     rows = []
 
@@ -119,6 +165,7 @@ def main():
         # Elo diffs (pre-match ratings, winner perspective)
         elo_diff_global  = 0.0
         elo_diff_surface = 0.0
+        elo_diff_rg      = 0.0
         if elo_hist is not None:
             # Look up winner's pre-match Elo
             w_row = elo_hist[(elo_hist["winner"] == w) & (elo_hist["date"] == date)]
@@ -127,11 +174,13 @@ def main():
                 if len(w_row) > 0:
                     w_global = w_row.iloc[0]["l_elo_global"]
                     w_surf   = w_row.iloc[0].get(f"l_elo_{surface}", ELO_INIT)
+                    w_rg     = w_row.iloc[0].get("l_elo_roland_garros", ELO_INIT)
                 else:
-                    w_global = w_surf = ELO_INIT
+                    w_global = w_surf = w_rg = ELO_INIT
             else:
                 w_global = w_row.iloc[0]["w_elo_global"]
                 w_surf   = w_row.iloc[0].get(f"w_elo_{surface}", ELO_INIT)
+                w_rg     = w_row.iloc[0].get("w_elo_roland_garros", ELO_INIT)
 
             # Look up loser's pre-match Elo
             l_row = elo_hist[(elo_hist["loser"] == l) & (elo_hist["date"] == date)]
@@ -140,33 +189,89 @@ def main():
                 if len(l_row) > 0:
                     l_global = l_row.iloc[0]["w_elo_global"]
                     l_surf   = l_row.iloc[0].get(f"w_elo_{surface}", ELO_INIT)
+                    l_rg     = l_row.iloc[0].get("w_elo_roland_garros", ELO_INIT)
                 else:
-                    l_global = l_surf = ELO_INIT
+                    l_global = l_surf = l_rg = ELO_INIT
             else:
                 l_global = l_row.iloc[0]["l_elo_global"]
                 l_surf   = l_row.iloc[0].get(f"l_elo_{surface}", ELO_INIT)
+                l_rg     = l_row.iloc[0].get("l_elo_roland_garros", ELO_INIT)
 
             elo_diff_global  = float(w_global) - float(l_global)
             elo_diff_surface = float(w_surf)   - float(l_surf)
+            if is_rg_tournament:
+                elo_diff_rg = float(w_rg) - float(l_rg)
 
+        # H2H on clay (running — only previous matches, no lookahead)
+        h2h_diff = _h2h_diff(w, l)
+        _h2h_update(w, l)
+
+        # Rest days diff (positive = winner had more recent rest)
+        rest_days_diff = 0.0
+        if "avg_rest_days_lastN" in w_stats.index and "avg_rest_days_lastN" in l_stats.index:
+            w_rest = w_stats.get("avg_rest_days_lastN", np.nan)
+            l_rest = l_stats.get("avg_rest_days_lastN", np.nan)
+            if pd.notna(w_rest) and pd.notna(l_rest):
+                rest_days_diff = float(w_rest) - float(l_rest)
+
+        # Quality-adjusted win rate diff
+        quality_wr_diff = 0.0
+        if "quality_winrate_lastN" in w_stats.index and "quality_winrate_lastN" in l_stats.index:
+            w_qwr = w_stats.get("quality_winrate_lastN", np.nan)
+            l_qwr = l_stats.get("quality_winrate_lastN", np.nan)
+            if pd.notna(w_qwr) and pd.notna(l_qwr):
+                quality_wr_diff = float(w_qwr) - float(l_qwr)
+
+        # Clay-specific rolling win rate diff (recent clay form only)
+        clay_wr_diff = 0.0
+        if "clay_winrate_lastN" in w_stats.index and "clay_winrate_lastN" in l_stats.index:
+            w_cwr = w_stats.get("clay_winrate_lastN", np.nan)
+            l_cwr = l_stats.get("clay_winrate_lastN", np.nan)
+            if pd.notna(w_cwr) and pd.notna(l_cwr):
+                clay_wr_diff = float(w_cwr) - float(l_cwr)
+
+        # Market probability diff — current match pre-match odds (0.0 when unavailable)
+        b365w = pd.to_numeric(m.get("b365w", np.nan), errors="coerce")
+        b365l = pd.to_numeric(m.get("b365l", np.nan), errors="coerce")
+        mkt_prob_diff = 0.0
+        if pd.notna(b365w) and pd.notna(b365l) and b365w > 1.0 and b365l > 1.0:
+            inv_w = 1.0 / b365w
+            inv_l = 1.0 / b365l
+            mkt_prob_diff = (inv_w / (inv_w + inv_l)) - (inv_l / (inv_w + inv_l))
+
+        # Round depth — later rounds = better opponents = stronger signal from rating features
         match_round  = m.get("Round", np.nan)
-        # ATP uses "Series", WTA uses "Tier"
+        round_depth  = float(ROUND_DEPTH_MAP.get(str(match_round), 3))
+
         match_series = m.get("Series", None) or m.get("Tier", np.nan)
         w_rank_raw   = pd.to_numeric(m.get("winner_rank", np.nan), errors="coerce")
         l_rank_raw   = pd.to_numeric(m.get("loser_rank",  np.nan), errors="coerce")
         max_rank     = max(w_rank_raw, l_rank_raw) if pd.notna(w_rank_raw) and pd.notna(l_rank_raw) else np.nan
 
         base = {
-            "winrate_diff":     w_stats["winrate_lastN"]       - l_stats["winrate_lastN"],
-            "odds_diff":        w_stats["avg_odds_lastN"]       - l_stats["avg_odds_lastN"],
-            "matches_diff":     w_stats["matches_played_lastN"] - l_stats["matches_played_lastN"],
-            "rank_diff":        rankB - rankA,
-            "surface_wr_diff":  surf_diff,
-            "elo_diff_global":  elo_diff_global,
-            "elo_diff_surface": elo_diff_surface,
-            "match_round":      match_round,
-            "match_series":     match_series,
-            "max_rank":         max_rank,
+            "winrate_diff":        w_stats["winrate_lastN"]       - l_stats["winrate_lastN"],
+            "odds_diff":           w_stats["avg_odds_lastN"]       - l_stats["avg_odds_lastN"],
+            "matches_diff":        w_stats["matches_played_lastN"] - l_stats["matches_played_lastN"],
+            "rank_diff":           rankB - rankA,
+            "surface_wr_diff":     surf_diff,
+            "elo_diff_global":     elo_diff_global,
+            "elo_diff_surface":    elo_diff_surface,
+            "h2h_clay_diff":       h2h_diff,
+            "mkt_prob_diff":       mkt_prob_diff,
+            "round_depth":         round_depth,
+            "rest_days_diff":      rest_days_diff,
+            "quality_winrate_diff": quality_wr_diff,
+            "elo_diff_rg":         elo_diff_rg,
+            "clay_winrate_diff":   clay_wr_diff,
+            # metadata (not features)
+            "match_round":         match_round,
+            "match_series":        match_series,
+            "max_rank":            max_rank,
+            "match_winner":        w,
+            "match_loser":         l,
+            "match_date":          str(date)[:10],
+            "b365w":               b365w,
+            "b365l":               b365l,
         }
 
         # Winner row
@@ -174,19 +279,30 @@ def main():
 
         # Loser row (symmetric — flip all diffs)
         rows.append({**base,
-            "winrate_diff":     -base["winrate_diff"],
-            "odds_diff":        -base["odds_diff"],
-            "matches_diff":     -base["matches_diff"],
-            "rank_diff":        -base["rank_diff"],
-            "surface_wr_diff":  -base["surface_wr_diff"],
-            "elo_diff_global":  -base["elo_diff_global"],
-            "elo_diff_surface": -base["elo_diff_surface"],
+            "winrate_diff":        -base["winrate_diff"],
+            "odds_diff":           -base["odds_diff"],
+            "matches_diff":        -base["matches_diff"],
+            "rank_diff":           -base["rank_diff"],
+            "surface_wr_diff":     -base["surface_wr_diff"],
+            "elo_diff_global":     -base["elo_diff_global"],
+            "elo_diff_surface":    -base["elo_diff_surface"],
+            "h2h_clay_diff":       -base["h2h_clay_diff"],
+            "mkt_prob_diff":       -base["mkt_prob_diff"],
+            "round_depth":          base["round_depth"],   # same for both players
+            "rest_days_diff":      -base["rest_days_diff"],
+            "quality_winrate_diff": -base["quality_winrate_diff"],
+            "elo_diff_rg":         -base["elo_diff_rg"],
+            "clay_winrate_diff":   -base["clay_winrate_diff"],
             "a_wins": 0,
         })
 
-    feature_cols = ["winrate_diff", "odds_diff", "matches_diff", "rank_diff",
-                    "surface_wr_diff", "elo_diff_global", "elo_diff_surface"]
-    df = pd.DataFrame(rows).dropna(subset=feature_cols)
+    # Core features required for a row to be kept
+    core_feature_cols = [
+        "winrate_diff", "odds_diff", "matches_diff", "rank_diff",
+        "surface_wr_diff", "elo_diff_global", "elo_diff_surface",
+        "h2h_clay_diff",
+    ]
+    df = pd.DataFrame(rows).dropna(subset=core_feature_cols)
     df["a_wins"] = df["a_wins"].astype(int)
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +311,8 @@ def main():
     print(f"Rows: {len(df):,}")
     print("Class balance:")
     print(df["a_wins"].value_counts(normalize=True))
+    mkt_coverage = df["mkt_prob_diff"].abs().gt(0).mean()
+    print(f"mkt_prob_diff coverage (non-zero rows): {mkt_coverage:.1%}")
 
 if __name__ == "__main__":
     main()

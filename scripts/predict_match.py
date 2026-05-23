@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 import joblib
@@ -5,6 +6,7 @@ from pathlib import Path
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from scripts.name_utils import canonical_name
+from scripts.model_utils import LGBMPipeline  # noqa: F401 — needed for joblib deserialization
 from config.tournaments import TOURNAMENTS
 from config.surfaces import SURFACE_TRAINING_FILTER
 
@@ -17,8 +19,19 @@ TOURNAMENT_REF_DATES = {
     "fo26": pd.to_datetime("2026-05-25"),
 }
 
-# Default log-rank for players not in rankings file (~200 = fringe tour player)
 _LOG_RANK_DEFAULT = np.log(200)
+
+# Ordinal round encoding — must match 04_build_ml_dataset.py
+ROUND_DEPTH_MAP = {
+    "R128": 1, "Round 1": 1, "1st Round": 1,
+    "R64":  2, "Round 2": 2, "2nd Round": 2,
+    "R32":  3, "Round 3": 3, "3rd Round": 3,
+    "R16":  4, "Round 4": 4, "4th Round": 4,
+    "QF":   5, "Quarterfinals": 5,
+    "SF":   6, "Semifinals": 6,
+    "F":    7, "The Final": 7, "Final": 7,
+    "RR":   2,
+}
 
 # Module-level caches keyed by (tournament, tour)
 _MODELS  = {}
@@ -26,6 +39,7 @@ _STATS   = {}
 _ELO     = {}
 _SURF_WR = {}
 _RANKS   = {}
+_H2H     = {}
 _CACHE   = {}
 
 
@@ -102,6 +116,14 @@ def _load(tournament: str, tour: str):
     else:
         _RANKS[key] = {}
 
+    # H2H clay records (keyed as "min_player|max_player" alphabetically)
+    h2h_path = Path(f"data/h2h_{tour}.json")
+    if h2h_path.exists():
+        with open(h2h_path) as f:
+            _H2H[key] = json.load(f)
+    else:
+        _H2H[key] = {}
+
     print(f"  Loaded model + stats for {tournament.upper()} {tour.upper()} "
           f"({len(_STATS[key])} players)")
 
@@ -115,7 +137,8 @@ def _elo_prob(a_elo: float, b_elo: float) -> float:
 
 def _get_elo(player, elo_df, col) -> float:
     if elo_df is not None and player in elo_df.index:
-        return float(elo_df.loc[player, col])
+        v = elo_df.loc[player, col] if col in elo_df.columns else _FALLBACK_ELO
+        return float(v) if pd.notna(v) else _FALLBACK_ELO
     return _FALLBACK_ELO
 
 
@@ -129,11 +152,17 @@ def safe_diff(x, y, default=0.0):
 
 
 def predict_match(A, B, tour="atp", tournament="ao26", **kwargs):
-    """Return probability that player A beats player B."""
+    """Return probability that player A beats player B.
+
+    Optional kwargs:
+      round_name  str   — e.g. "R64", "QF" — used for round_depth feature
+      b365w       float — pre-match B365 odds for player A (winner perspective)
+      b365l       float — pre-match B365 odds for player B
+    """
     A = canonical_name(A)
     B = canonical_name(B)
 
-    cache_key = (A, B, tour, tournament)
+    cache_key = (A, B, tour, tournament, kwargs.get("round_name"))
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
@@ -145,6 +174,7 @@ def predict_match(A, B, tour="atp", tournament="ao26", **kwargs):
     elo     = _ELO[key]
     surf_wr = _SURF_WR[key]
     ranks   = _RANKS[key]
+    h2h     = _H2H[key]
     surface = TOURNAMENTS[tournament]["surface"]
 
     a_surf   = _get_elo(A, elo, f"elo_{surface}")
@@ -152,7 +182,7 @@ def predict_match(A, B, tour="atp", tournament="ao26", **kwargs):
     a_global = _get_elo(A, elo, "elo_global")
     b_global = _get_elo(B, elo, "elo_global")
 
-    # No rolling stats for this player — fall back to Elo blend
+    # Fallback when no rolling stats available
     if A not in stats.index or B not in stats.index:
         p = 0.5 * _elo_prob(a_global, b_global) + 0.5 * _elo_prob(a_surf, b_surf)
         p = min(max(p, 0.05), 0.95)
@@ -168,17 +198,74 @@ def predict_match(A, B, tour="atp", tournament="ao26", **kwargs):
     swr_a = surf_wr.get(A, float("nan"))
     swr_b = surf_wr.get(B, float("nan"))
 
+    # H2H clay diff (A wins on clay minus B wins on clay, all history)
+    h2h_clay_diff = 0.0
+    h2h_key = f"{min(A, B)}|{max(A, B)}"
+    if h2h_key in h2h:
+        rec = h2h[h2h_key]
+        p1_is_A = rec["p1"] == A or canonical_name(rec["p1"]) == A
+        a_clay = rec["clay"]["p1"] if p1_is_A else rec["clay"]["p2"]
+        b_clay = rec["clay"]["p2"] if p1_is_A else rec["clay"]["p1"]
+        h2h_clay_diff = float(a_clay - b_clay)
+
+    # Rest days diff (positive = A had more rest on average)
+    rest_days_diff = safe_diff(
+        a.get("avg_rest_days_lastN", float("nan")),
+        b.get("avg_rest_days_lastN", float("nan")),
+    )
+
+    # Quality-adjusted win rate diff
+    quality_winrate_diff = safe_diff(
+        a.get("quality_winrate_lastN", float("nan")),
+        b.get("quality_winrate_lastN", float("nan")),
+    )
+
+    # Market probability diff — use passed odds when available, else neutral 0.0
+    mkt_prob_diff = 0.0
+    b365w = kwargs.get("b365w")
+    b365l = kwargs.get("b365l")
+    if b365w is not None and b365l is not None:
+        try:
+            bw, bl = float(b365w), float(b365l)
+            if bw > 1.0 and bl > 1.0:
+                inv_a = 1.0 / bw
+                inv_b = 1.0 / bl
+                mkt_prob_diff = (inv_a / (inv_a + inv_b)) - (inv_b / (inv_a + inv_b))
+        except (TypeError, ValueError):
+            pass
+
+    # Round depth (default to mid-draw 3 when unspecified)
+    round_name  = kwargs.get("round_name", "R32")
+    round_depth = float(ROUND_DEPTH_MAP.get(str(round_name), 3))
+
+    # Roland Garros-specific Elo diff (only for RG tournaments)
+    is_rg = tournament.startswith("fo") or "roland" in TOURNAMENTS[tournament].get("name", "").lower()
+    elo_diff_rg = 0.0
+    if is_rg:
+        a_rg = _get_elo(A, elo, "elo_roland_garros")
+        b_rg = _get_elo(B, elo, "elo_roland_garros")
+        elo_diff_rg = a_rg - b_rg
+
     features = {
-        "winrate_diff":     safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
-        "odds_diff":        safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
-        "matches_diff":     safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
-        "rank_diff":        rank_b - rank_a,
-        "surface_wr_diff":  safe_diff(swr_a, swr_b),
-        "elo_diff_global":  a_global - b_global,
-        "elo_diff_surface": a_surf   - b_surf,
+        "winrate_diff":          safe_diff(a["winrate_lastN"],       b["winrate_lastN"]),
+        "odds_diff":             safe_diff(a["avg_odds_lastN"],       b["avg_odds_lastN"]),
+        "matches_diff":          safe_diff(a["matches_played_lastN"], b["matches_played_lastN"]),
+        "rank_diff":             rank_b - rank_a,
+        "surface_wr_diff":       safe_diff(swr_a, swr_b),
+        "elo_diff_global":       a_global - b_global,
+        "elo_diff_surface":      a_surf   - b_surf,
+        "h2h_clay_diff":         h2h_clay_diff,
+        "mkt_prob_diff":         mkt_prob_diff,
+        "quality_winrate_diff":  quality_winrate_diff,
+        "elo_diff_rg":           elo_diff_rg,
+        "clay_winrate_diff":     safe_diff(
+            a.get("clay_winrate_lastN", float("nan")),
+            b.get("clay_winrate_lastN", float("nan")),
+        ),
     }
 
     X = pd.DataFrame([features])
+    # Model selects only the features it was trained on
     try:
         model_cols = list(model.named_steps["scaler"].feature_names_in_)
         X = X[model_cols]
