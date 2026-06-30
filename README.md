@@ -231,6 +231,16 @@ grand-slam-predictions/
 
 ## How to run
 
+### Prerequisites
+
+```bash
+git clone https://github.com/maanitmehta/grand-slam-predictions.git
+cd grand-slam-predictions
+python3 -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
 ### First-time setup (run once)
 
 ```bash
